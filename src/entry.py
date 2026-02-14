@@ -337,11 +337,16 @@ class Default(WorkerEntrypoint):
 
                 body, status, headers = json_response({"guilds": out}, 200, allowed_origin)
                 return Response(body, status=status, headers=headers)
-
+            if path == "/test":
+                resp = await fetch("https://example.com")
+                print("Example status:", resp.status)
+                body, status, headers = json_response({"test": "ok"}, status, allowed_origin)
+                return Response(body, status=status, headers=headers)
 
 
             # not found
             return Response("Not Found", status=404)
+        
         except Exception as e:
             # crash handling
             print("Worker crash:", getattr(e, "stack", e))
