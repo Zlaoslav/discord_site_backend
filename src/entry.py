@@ -21,9 +21,10 @@ import time
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
         # env: try to read from self.env (common pattern), fallback to empty dict
-        CLIENT_SECRET = self.env["DISCORD_CLIENT_SECRET"]
-        BOT_TOKEN = self.env["BOT_TOKEN"]
-        JWT_SECRET = self.env["JWT_SECRET"]
+        CLIENT_SECRET = self.env.DISCORD_CLIENT_SECRET
+        BOT_TOKEN = self.env.BOT_TOKEN
+        JWT_SECRET = self.env.JWT_SECRET
+
 
 
         if not CLIENT_SECRET or not BOT_TOKEN or not JWT_SECRET:
