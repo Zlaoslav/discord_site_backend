@@ -1,5 +1,5 @@
 # entry.py
-from workers import Response, WorkerEntrypoint, fetch # pyright: ignore[reportMissingImports]
+from workers import Response, WorkerEntrypoint, fetch  # pyright: ignore[reportMissingImports] # runtime-provided
 from submodule import (
     CLIENT_ID,
     REDIRECT_URI,
@@ -17,6 +17,8 @@ import urllib.parse
 import time
 import os
 import json
+import hmac
+import hashlib
 
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
@@ -26,11 +28,15 @@ class Default(WorkerEntrypoint):
             BOT_TOKEN = self.env.BOT_TOKEN
             JWT_SECRET = self.env.JWT_SECRET
             BOT_ID = self.env.BOT_ID
+            DB_SERVICE_URL = getattr(self.env, "DB_SERVICE_URL", None)
+            SERVICE_SECRET = getattr(self.env, "SERVICE_SECRET", None)
         except Exception:
             CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
             BOT_TOKEN = os.environ.get("BOT_TOKEN")
             JWT_SECRET = os.environ.get("JWT_SECRET")
             BOT_ID = os.environ.get("BOT_ID")
+            DB_SERVICE_URL = os.environ.get("DB_SERVICE_URL")
+            SERVICE_SECRET = os.environ.get("SERVICE_SECRET")
 
         if not CLIENT_SECRET or not BOT_TOKEN or not JWT_SECRET:
             return Response("Server misconfigured: missing secrets", status=500)
@@ -47,13 +53,12 @@ class Default(WorkerEntrypoint):
         parsed = urllib.parse.urlparse(request.url)
         path = parsed.path
 
-        # helper: list of KV binding names to try
+        # helper: list of KV binding names to try (kept for backward compatibility if you still have KV)
         def _kv_names():
-            # порядок: предпочтительный биндинг сначала
             return ["OAUTH_TOKENS", "OAUTH_KV", "TOKEN_STORE"]
 
         async def _kv_put(key, value):
-            # try put into available kv bindings
+            # try put into available kv bindings (kept as fallback if you have KV)
             for name in _kv_names():
                 try:
                     kv = getattr(self.env, name, None)
@@ -62,7 +67,6 @@ class Default(WorkerEntrypoint):
                 if kv is not None:
                     try:
                         await kv.put(key, value)
-                        # verify immediately (some runtimes accept put but may fail)
                         got = await kv.get(key)
                         if got:
                             return True, name
@@ -86,6 +90,50 @@ class Default(WorkerEntrypoint):
                         print(f"KV get failed for {name}: {e}")
                         continue
             return None, None
+
+        # DB service helpers (use DB_SERVICE_URL + SERVICE_SECRET)
+        async def _db_store_token(user_id: str, token_json_obj: dict) -> bool:
+            if not DB_SERVICE_URL or not SERVICE_SECRET:
+                return False
+            body_bytes = json.dumps({"user_id": user_id, "token_json": token_json_obj}).encode()
+            sig_hex = hmac.new(SERVICE_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest()
+            try:
+                resp = await fetch(
+                    f"{DB_SERVICE_URL.rstrip('/')}/token",
+                    method="POST",
+                    headers={"Content-Type": "application/json", "X-Service-Sign": sig_hex},
+                    body=body_bytes,
+                )
+                return resp.status == 200
+            except Exception as e:
+                print("db store fetch failed:", e)
+                return False
+
+        async def _db_get_token(user_id: str):
+            if not DB_SERVICE_URL or not SERVICE_SECRET:
+                return None
+            msg = f"GET:{user_id}".encode()
+            sig_hex = hmac.new(SERVICE_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+            try:
+                resp = await fetch(
+                    f"{DB_SERVICE_URL.rstrip('/')}/token/{urllib.parse.quote(user_id)}",
+                    method="GET",
+                    headers={"X-Service-Sign": sig_hex},
+                )
+                if resp.status == 200:
+                    j = await resp.json()
+                    return j.get("token_json")
+                else:
+                    # non-200 — return None (caller handles hint/status)
+                    try:
+                        text = await resp.text()
+                        print("DB get non-200:", resp.status, text)
+                    except Exception:
+                        pass
+                    return None
+            except Exception as e:
+                print("db get fetch failed:", e)
+                return None
 
         try:
             # ===== /login =====
@@ -178,15 +226,34 @@ class Default(WorkerEntrypoint):
                     body, status, headers = json_response({"error": "Invalid user response"}, 502, allowed_origin)
                     return Response(body, status=status, headers=headers)
 
-                # --- try to store tokens in KV under several possible names ---
-                saved_ok, saved_name = await _kv_put(f"user:{user['id']}", json.dumps(token_json))
+                # --- try to store tokens in DB service first, fallback to KV if available ---
+                saved_ok = False
+                saved_name = None
+                try:
+                    user_id = user.get("id")
+                    if user_id:
+                        saved_ok = await _db_store_token(user_id, token_json)
+                except Exception as e:
+                    print("DB store exception:", e)
+                    saved_ok = False
+
                 if not saved_ok:
-                    # set a non-HttpOnly cookie for debug (short lived) so frontend can see failure
-                    debug_cookie = "oauth_saved=no; Path=/; Max-Age=60; SameSite=None; Secure"
-                    print("KV store failed for all configured bindings")
-                else:
+                    # fallback to KV if configured
+                    try:
+                        kv_ok, kv_name = await _kv_put(f"user:{user['id']}", json.dumps(token_json))
+                        if kv_ok:
+                            saved_ok = True
+                            saved_name = kv_name
+                            print("Token saved in KV binding (fallback):", kv_name)
+                    except Exception as e:
+                        print("KV fallback put failed:", e)
+
+                # debug cookie to help frontend detect storage success/failure (short-lived, not HttpOnly)
+                if saved_ok:
                     debug_cookie = "oauth_saved=yes; Path=/; Max-Age=60; SameSite=None; Secure"
-                    print("Token saved in KV binding:", saved_name)
+                else:
+                    debug_cookie = "oauth_saved=no; Path=/; Max-Age=60; SameSite=None; Secure"
+                    print("Token storage failed for DB and KV")
 
                 # create jwt
                 now = int(time.time())
@@ -199,24 +266,19 @@ class Default(WorkerEntrypoint):
                     "exp": now + 86400,
                 }, JWT_SECRET)
 
-                # respond: set session cookie + debug cookie (non-HttpOnly) + redirect fragment for backward compat
+                # respond: set session cookie (HttpOnly) + redirect fragment for backward compat
                 redirect_to = FRONTEND_URL + "#token=" + urllib.parse.quote(jwt, safe='')
-                # session cookie HttpOnly
                 session_cookie = f"session={jwt}; Domain=pollpi.slavi.workers.dev; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=86400"
+
                 headers = {
                     "Location": redirect_to,
                     "Set-Cookie": session_cookie,
-                    # debug cookie (not HttpOnly) so frontend JS can read oauth_saved
-                    "Set-OAuth-Saved": debug_cookie  # we'll also push this as a separate header because some runtimes clobber multiple Set-Cookie keys in dict
+                    # auxiliary header to bubble debug info if runtime strips second Set-Cookie
+                    "X-OAuth-Saved": debug_cookie
                 }
-                # Note: some runtimes don't allow two Set-Cookie keys in dict. To be robust, we'll also return oauth_saved in body if CORS allowed (for debug).
                 if allowed_origin:
                     headers.update(cors_headers(allowed_origin))
 
-                # Cloudflare Python runtime sometimes doesn't accept two Set-Cookie via dict.
-                # So return response with both headers; if runtime discards second Set-Cookie header,
-                # frontend can still read 'oauth_saved' from response body (below) because we return JSON on 200,
-                # but here we must redirect, so frontend should check debug Cookie or query backend /me for success.
                 return Response(None, status=302, headers=headers)
 
             # ===== /me =====
@@ -256,19 +318,38 @@ class Default(WorkerEntrypoint):
 
                 user_id = payload["sub"]
 
-                # try read KV (multiple bindings)
-                stored, used_kv = await _kv_get(f"user:{user_id}")
+                # try read from DB service first
+                stored = None
+                try:
+                    stored = await _db_get_token(user_id)
+                except Exception as e:
+                    print("DB read failed:", e)
+                    stored = None
+
+                # fallback to KV if DB missing
+                if not stored:
+                    try:
+                        kv_stored, kv_name = await _kv_get(f"user:{user_id}")
+                        if kv_stored:
+                            stored = kv_stored
+                    except Exception as e:
+                        print("KV fallback read failed:", e)
+
                 if not stored:
                     # helpful response with hint, not opaque 403
                     body, status, headers = json_response(
-                        {"error": "No oauth tokens stored", "reason": "no_oauth_tokens", "hint": "Re-authorize or ensure worker KV binding OAUTH_TOKENS exists"},
+                        {"error": "No oauth tokens stored", "reason": "no_oauth_tokens", "hint": "Re-authorize or ensure DB service accessible"},
                         403,
                         allowed_origin
                     )
                     return Response(body, status=status, headers=headers)
 
                 try:
-                    token_json = json.loads(stored)
+                    # if stored is a string (KV) or already dict (DB service)
+                    if isinstance(stored, str):
+                        token_json = json.loads(stored)
+                    else:
+                        token_json = stored
                 except Exception as e:
                     print("Failed to parse stored token JSON:", e)
                     body, status, headers = json_response({"error": "Invalid stored token"}, 500, allowed_origin)
@@ -280,9 +361,11 @@ class Default(WorkerEntrypoint):
                     return Response(body, status=status, headers=headers)
 
                 # get user's guilds using user's access_token
-                guilds_resp = await fetch("https://discord.com/api/users/@me/guilds", headers={"Authorization": f"Bearer {user_access_token}"})
+                guilds_resp = await fetch(
+                    "https://discord.com/api/users/@me/guilds",
+                    headers={"Authorization": f"Bearer {user_access_token}"}
+                )
                 if not guilds_resp.ok:
-                    # possibly expired token -> hint to reauthorize
                     try:
                         t = await guilds_resp.text()
                     except Exception:
@@ -299,8 +382,11 @@ class Default(WorkerEntrypoint):
                     perms = int(g.get("permissions", 0))
                     is_admin = (perms & admin_bit) != 0
                     bot_present = False
-                    if BOT_ID:
-                        bot_check = await fetch(f"https://discord.com/api/guilds/{g_id}/members/{BOT_ID}", headers={"Authorization": f"Bot {BOT_TOKEN}"})
+                    if CLIENT_ID:
+                        bot_check = await fetch(
+                            f"https://discord.com/api/guilds/{g_id}/members/{CLIENT_ID}",
+                            headers={"Authorization": f"Bot {BOT_TOKEN}"}
+                        )
                         bot_present = bot_check.ok
                     out.append({
                         "id": g_id,
@@ -344,13 +430,19 @@ class Default(WorkerEntrypoint):
                     body, status, headers = json_response({"error": "Invalid request"}, 400, allowed_origin)
                     return Response(body, status=status, headers=headers)
 
-                member_resp = await fetch(f"https://discord.com/api/guilds/{guild_id}/members/{payload['sub']}", headers={"Authorization": f"Bot {BOT_TOKEN}"})
+                member_resp = await fetch(
+                    f"https://discord.com/api/guilds/{guild_id}/members/{payload['sub']}",
+                    headers={"Authorization": f"Bot {BOT_TOKEN}"}
+                )
                 if not member_resp.ok:
                     body, status, headers = json_response({"error": "User not member or bot missing perms"}, 403, allowed_origin)
                     return Response(body, status=status, headers=headers)
                 member = await member_resp.json()
 
-                roles_resp = await fetch(f"https://discord.com/api/guilds/{guild_id}/roles", headers={"Authorization": f"Bot {BOT_TOKEN}"})
+                roles_resp = await fetch(
+                    f"https://discord.com/api/guilds/{guild_id}/roles",
+                    headers={"Authorization": f"Bot {BOT_TOKEN}"}
+                )
                 if not roles_resp.ok:
                     body, status, headers = json_response({"error": "Failed to fetch roles"}, 500, allowed_origin)
                     return Response(body, status=status, headers=headers)
