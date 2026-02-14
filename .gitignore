@@ -1,8 +1,7 @@
 # Logs
 uv.lock
-pyproject.toml
-pyproject
-.toml
+wrangler.toml
+
 
 logs
 _.log
@@ -71,4 +70,3 @@ jspm_packages/
 python_modules/
 .venv/
 .venv-workers/
-pyproject.toml
