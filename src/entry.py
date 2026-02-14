@@ -29,12 +29,10 @@ class Default(WorkerEntrypoint):
             CLIENT_SECRET = self.env.DISCORD_CLIENT_SECRET
             BOT_TOKEN = self.env.BOT_TOKEN
             JWT_SECRET = self.env.JWT_SECRET
-            BOT_ID = self.env.BOT_ID
         except Exception:
             CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
             BOT_TOKEN = os.environ.get("BOT_TOKEN")
             JWT_SECRET = os.environ.get("JWT_SECRET")
-            BOT_ID = os.environ.get("BOT_ID")
 
         if not CLIENT_SECRET or not BOT_TOKEN or not JWT_SECRET:
             return Response("Server misconfigured: missing secrets", status=500)
@@ -336,9 +334,9 @@ class Default(WorkerEntrypoint):
                     is_admin = (perms & admin_bit) != 0
 
                     bot_present = False
-                    if BOT_ID:
+                    if CLIENT_ID:
                         bot_check = await fetch(
-                            f"https://discord.com/api/guilds/{g['id']}/members/{BOT_ID}",
+                            f"https://discord.com/api/guilds/{g['id']}/members/{CLIENT_ID}",
                             headers={"Authorization": f"Bot {BOT_TOKEN}"}
                         )
                         bot_present = bot_check.ok
