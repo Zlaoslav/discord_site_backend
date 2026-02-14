@@ -109,15 +109,12 @@ class Default(WorkerEntrypoint):
                 })
 
                 try:
+                    # IMPORTANT: pass options as named args, not as a positional dict
                     token_resp = await fetch(
                         "https://discord.com/api/oauth2/token",
-                        {
-                            "method": "POST",
-                            "headers": {
-                                "Content-Type": "application/x-www-form-urlencoded"
-                            },
-                            "body": form_data.encode(),  # ВАЖНО
-                        },
+                        method="POST",
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        body=form_data.encode(),  # send bytes
                     )
                 except Exception as e:
                     print("Token exchange fetch exception:", e)
@@ -146,15 +143,26 @@ class Default(WorkerEntrypoint):
                 token_json = await token_resp.json()
 
                 # ---- fetch user ----
-                user_resp = await fetch(
-                    "https://discord.com/api/users/@me",
-                    {"headers": {"Authorization": f"Bearer {token_json.get('access_token')}"}},
-                )
+                try:
+                    user_resp = await fetch(
+                        "https://discord.com/api/users/@me",
+                        headers={"Authorization": f"Bearer {token_json.get('access_token')}"}
+                    )
+                except Exception as e:
+                    print("User fetch request failed:", e)
+                    body, status, headers = json_response(
+                        {"error": "Failed to fetch user"},
+                        502,
+                        allowed_origin,
+                    )
+                    return Response(body, status=status, headers=headers)
 
                 if not user_resp.ok:
-                    t = await user_resp.text()
-                    print("User fetch failed:", t)
-
+                    try:
+                        t = await user_resp.text()
+                    except Exception:
+                        t = "<failed to read user body>"
+                    print("Failed to fetch user:", t)
                     body, status, headers = json_response(
                         {"error": "User fetch failed"},
                         502,
@@ -234,7 +242,86 @@ class Default(WorkerEntrypoint):
                 return Response(body, status=status, headers=headers)
 
             # ============================================================
-            # ======================== /guilds ===========================
+            # ======================== /action ===========================
+            # ============================================================
+
+            if path == "/action":
+                if request.method != "POST":
+                    body, status, headers = json_response({"error": "Method not allowed"}, 405, allowed_origin)
+                    return Response(body, status=status, headers=headers)
+
+                auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+                payload = None
+                if auth_header and auth_header.startswith("Bearer "):
+                    token = auth_header[7:].strip()
+                    payload = verify_jwt(token, JWT_SECRET)
+                if not payload:
+                    cookies = parse_cookies(request.headers.get("Cookie"))
+                    token = cookies.get("session")
+                    if token:
+                        payload = verify_jwt(token, JWT_SECRET)
+                if not payload:
+                    body, status, headers = json_response({"error": "Not authenticated"}, 401, allowed_origin)
+                    return Response(body, status=status, headers=headers)
+
+                try:
+                    body_json = await request.json()
+                except Exception:
+                    body, status, headers = json_response({"error": "Invalid JSON"}, 400, allowed_origin)
+                    return Response(body, status=status, headers=headers)
+                guild_id = body_json.get("guildId")
+                required = body_json.get("required")
+                if not guild_id or not required or required not in PERMISSION_BITS:
+                    body, status, headers = json_response({"error": "Invalid request"}, 400, allowed_origin)
+                    return Response(body, status=status, headers=headers)
+
+                # verify membership using bot token
+                member_resp = await fetch(
+                    f"https://discord.com/api/guilds/{guild_id}/members/{payload['sub']}",
+                    headers={"Authorization": f"Bot {BOT_TOKEN}"}
+                )
+                if not member_resp.ok:
+                    body, status, headers = json_response({"error": "User not member or bot missing perms"}, 403, allowed_origin)
+                    return Response(body, status=status, headers=headers)
+                member = await member_resp.json()
+
+                roles_resp = await fetch(
+                    f"https://discord.com/api/guilds/{guild_id}/roles",
+                    headers={"Authorization": f"Bot {BOT_TOKEN}"}
+                )
+                if not roles_resp.ok:
+                    body, status, headers = json_response({"error": "Failed to fetch roles"}, 500, allowed_origin)
+                    return Response(body, status=status, headers=headers)
+                roles = await roles_resp.json()
+
+                perms = 0
+                for role_id in member.get("roles", []):
+                    r = next((x for x in roles if x.get("id") == role_id), None)
+                    if r:
+                        perms |= int(r.get("permissions", 0))
+
+                admin_bit = PERMISSION_BITS["ADMINISTRATOR"]
+                required_bit = PERMISSION_BITS[required]
+                if (perms & admin_bit) == 0 and (perms & required_bit) == 0:
+                    body, status, headers = json_response({"error": "Forbidden"}, 403, allowed_origin)
+                    return Response(body, status=status, headers=headers)
+
+                body, status, headers = json_response({"ok": True}, 200, allowed_origin)
+                return Response(body, status=status, headers=headers)
+
+            # ============================================================
+            # ========================= /logout ==========================
+            # ============================================================
+
+            if path == "/logout":
+                headers = {"Location": FRONTEND_URL}
+                headers["Set-Cookie"] = "session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0"
+                if allowed_origin:
+                    headers.update(cors_headers(allowed_origin))
+                return Response(None, status=302, headers=headers)
+
+            # ============================================================
+            # ========================= /guilds ==========================
             # ============================================================
 
             if path == "/guilds":
@@ -253,7 +340,13 @@ class Default(WorkerEntrypoint):
                     )
                     return Response(body, status=status, headers=headers)
 
-                stored = await self.env.OAUTH_TOKENS.get(f"user:{payload['sub']}")
+                stored = None
+                try:
+                    if getattr(self.env, "OAUTH_TOKENS", None):
+                        stored = await self.env.OAUTH_TOKENS.get(f"user:{payload['sub']}")
+                except Exception as e:
+                    print("KV read failed:", e)
+
                 if not stored:
                     body, status, headers = json_response(
                         {"error": "Reauthorize required"},
@@ -266,7 +359,7 @@ class Default(WorkerEntrypoint):
 
                 guilds_resp = await fetch(
                     "https://discord.com/api/users/@me/guilds",
-                    {"headers": {"Authorization": f"Bearer {token_json.get('access_token')}"}},
+                    headers={"Authorization": f"Bearer {token_json.get('access_token')}"}
                 )
 
                 if not guilds_resp.ok:
@@ -290,7 +383,7 @@ class Default(WorkerEntrypoint):
                     if BOT_ID:
                         bot_check = await fetch(
                             f"https://discord.com/api/guilds/{g['id']}/members/{BOT_ID}",
-                            {"headers": {"Authorization": f"Bot {BOT_TOKEN}"}},
+                            headers={"Authorization": f"Bot {BOT_TOKEN}"}
                         )
                         bot_present = bot_check.ok
 
@@ -306,6 +399,13 @@ class Default(WorkerEntrypoint):
                     200,
                     allowed_origin,
                 )
+                return Response(body, status=status, headers=headers)
+
+            # simple test
+            if path == "/test":
+                resp = await fetch("https://example.com")
+                print("Example status:", resp.status)
+                body, status, headers = json_response({"test": "ok"}, 200, allowed_origin)
                 return Response(body, status=status, headers=headers)
 
             # ============================================================
