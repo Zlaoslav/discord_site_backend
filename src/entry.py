@@ -89,121 +89,77 @@ class Default(WorkerEntrypoint):
             # ============================================================
 
             if path == "/callback":
-
-                qs = urllib.parse.parse_qs(parsed.query)
+                q = parsed.query
+                qs = urllib.parse.parse_qs(q)
                 code = qs.get("code", [None])[0]
                 state = qs.get("state", [None])[0]
 
                 cookies = parse_cookies(request.headers.get("Cookie"))
-
                 if not code or cookies.get("oauth_state") != state:
                     return Response("Invalid state or code", status=400)
 
-                # ---- exchange code -> token ----
-                form_data = urllib.parse.urlencode({
-                    "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET,
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": REDIRECT_URI,
-                })
-
                 try:
-                    # IMPORTANT: pass options as named args, not as a positional dict
+                    body = urllib.parse.urlencode({
+                        "client_id": CLIENT_ID,
+                        "client_secret": CLIENT_SECRET,
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": REDIRECT_URI,
+                    })
+
                     token_resp = await fetch(
                         "https://discord.com/api/oauth2/token",
                         method="POST",
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        body=form_data.encode(),  # send bytes
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded"
+                        },
+                        body=body
                     )
+
                 except Exception as e:
-                    print("Token exchange fetch exception:", e)
-                    body, status, headers = json_response(
-                        {"error": "Token exchange request failed"},
-                        502,
-                        allowed_origin,
+                    return Response(
+                        f"Token exchange fetch exception: {str(e)}",
+                        status=500
                     )
-                    return Response(body, status=status, headers=headers)
 
-                if not token_resp.ok:
-                    try:
-                        t = await token_resp.text()
-                    except Exception:
-                        t = "<failed to read body>"
-
-                    print("Token exchange failed:", t)
-
-                    body, status, headers = json_response(
-                        {"error": "Token exchange failed", "details": t},
-                        502,
-                        allowed_origin,
+                if token_resp.status != 200:
+                    text = await token_resp.text()
+                    return Response(
+                        f"Token exchange request failed: {text}",
+                        status=500
                     )
-                    return Response(body, status=status, headers=headers)
 
                 token_json = await token_resp.json()
+                access_token = token_json.get("access_token")
 
-                # ---- fetch user ----
-                try:
-                    user_resp = await fetch(
-                        "https://discord.com/api/users/@me",
-                        headers={"Authorization": f"Bearer {token_json.get('access_token')}"}
-                    )
-                except Exception as e:
-                    print("User fetch request failed:", e)
-                    body, status, headers = json_response(
-                        {"error": "Failed to fetch user"},
-                        502,
-                        allowed_origin,
-                    )
-                    return Response(body, status=status, headers=headers)
+                if not access_token:
+                    return Response("No access token returned", status=500)
 
-                if not user_resp.ok:
-                    try:
-                        t = await user_resp.text()
-                    except Exception:
-                        t = "<failed to read user body>"
-                    print("Failed to fetch user:", t)
-                    body, status, headers = json_response(
-                        {"error": "User fetch failed"},
-                        502,
-                        allowed_origin,
-                    )
-                    return Response(body, status=status, headers=headers)
+                user_resp = await fetch(
+                    "https://discord.com/api/users/@me",
+                    headers={
+                        "Authorization": f"Bearer {access_token}"
+                    }
+                )
+
+                if user_resp.status != 200:
+                    return Response("User fetch failed", status=500)
 
                 user = await user_resp.json()
 
-                # ---- store oauth tokens in KV (optional) ----
-                try:
-                    if getattr(self.env, "OAUTH_TOKENS", None):
-                        await self.env.OAUTH_TOKENS.put(
-                            f"user:{user['id']}",
-                            json.dumps(token_json),
-                        )
-                except Exception as e:
-                    print("KV store failed:", e)
-
-                # ---- create JWT ----
                 now = int(time.time())
-
-                jwt = sign_jwt({
+                jwt_token = sign_jwt({
                     "sub": user["id"],
                     "username": user.get("username"),
-                    "discriminator": user.get("discriminator"),
                     "avatar": user.get("avatar"),
                     "iat": now,
                     "exp": now + 86400,
                 }, JWT_SECRET)
 
-                redirect_to = FRONTEND_URL + "#token=" + urllib.parse.quote(jwt, safe="")
-
-                headers = {"Location": redirect_to}
-                headers["Set-Cookie"] = (
-                    "oauth_state=; HttpOnly; Secure; SameSite=None; "
-                    "Path=/; Max-Age=0"
-                )
-
-                if allowed_origin:
-                    headers.update(cors_headers(allowed_origin))
+                headers = {
+                    "Location": FRONTEND_URL,
+                    "Set-Cookie": f"auth_token={jwt_token}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=86400"
+                }
 
                 return Response(None, status=302, headers=headers)
 
