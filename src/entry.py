@@ -21,10 +21,10 @@ import time
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
         # env: try to read from self.env (common pattern), fallback to empty dict
-        env = getattr(self, "env", {}) or {}
-        CLIENT_SECRET = env.get("DISCORD_CLIENT_SECRET")
-        BOT_TOKEN = env.get("BOT_TOKEN")
-        JWT_SECRET = env.get("JWT_SECRET")
+        CLIENT_SECRET = self.env["DISCORD_CLIENT_SECRET"]
+        BOT_TOKEN = self.env["BOT_TOKEN"]
+        JWT_SECRET = self.env["JWT_SECRET"]
+
 
         if not CLIENT_SECRET or not BOT_TOKEN or not JWT_SECRET:
             return Response("Server misconfigured: missing secrets", status=500)
@@ -166,13 +166,13 @@ class Default(WorkerEntrypoint):
                     body, status, headers = json_response({"error": "Invalid request"}, 400, allowed_origin)
                     return Response(body, status=status, headers=headers)
 
-                member_resp = await fetch(f"https://discord.com/api/guilds/{guild_id}/members/{payload['sub']}", {"headers": {"Authorization": f"Bot {env.get('BOT_TOKEN')}"}})
+                member_resp = await fetch(f"https://discord.com/api/guilds/{guild_id}/members/{payload['sub']}", {"headers": {"Authorization": f"Bot {BOT_TOKEN}"}})
                 if not member_resp.ok:
                     body, status, headers = json_response({"error": "User not member or bot missing perms"}, 403, allowed_origin)
                     return Response(body, status=status, headers=headers)
                 member = await member_resp.json()
 
-                roles_resp = await fetch(f"https://discord.com/api/guilds/{guild_id}/roles", {"headers": {"Authorization": f"Bot {env.get('BOT_TOKEN')}"}})
+                roles_resp = await fetch(f"https://discord.com/api/guilds/{guild_id}/roles", {"headers": {"Authorization": f"Bot {BOT_TOKEN}"}})
                 if not roles_resp.ok:
                     body, status, headers = json_response({"error": "Failed to fetch roles"}, 500, allowed_origin)
                     return Response(body, status=status, headers=headers)
