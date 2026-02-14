@@ -1,5 +1,6 @@
 # Logs
 uv.lock
+pyproject.toml
 
 logs
 _.log
@@ -14,6 +15,7 @@ lerna-debug.log*
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Runtime data
+
 
 pids
 _.pid

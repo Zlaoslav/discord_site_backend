@@ -1,5 +1,5 @@
 # entry.py
-from workers import Response, WorkerEntrypoint, fetch  # runtime-provided
+from workers import Response, WorkerEntrypoint, fetch  # pyright: ignore[reportMissingImports] # runtime-provided
 from submodule import (
     CLIENT_ID,
     REDIRECT_URI,
