@@ -12,7 +12,7 @@ REDIRECT_URI = "https://pollpi.slavi.workers.dev/callback"
 FRONTEND_URL = "https://https://pollpi.dpdns.org/"
 
 ALLOWED_ORIGINS = [
-    "https://pollpi.dpdns.org/",
+    "https://pollpi.dpdns.org",
     "https://pollpi.slavi.workers.dev",
     "http://localhost:5173",
 ]
