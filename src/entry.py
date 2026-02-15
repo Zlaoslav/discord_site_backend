@@ -529,11 +529,7 @@ class Default(WorkerEntrypoint):
 
                         token_json = await get_stored_token(user_id)
                         if not token_json:
-                            body, status, headers = json_response(
-                                {"error": "No oauth tokens stored", "reason": "no_oauth_tokens", "hint": "Re-authorize or ensure DB service accessible"},
-                                403,
-                                allowed_origin
-                            )
+                            body, status, headers = json_response({"error": "No oauth tokens stored"}, 403, allowed_origin)
                             return Response(body, status=status, headers=headers)
 
                         user_access_token = token_json.get("access_token")
@@ -541,77 +537,57 @@ class Default(WorkerEntrypoint):
                             body, status, headers = json_response({"error": "Stored token missing access_token"}, 403, allowed_origin)
                             return Response(body, status=status, headers=headers)
 
-                        guilds_resp = await fetch(
+                        # 1️⃣ Гильдии пользователя
+                        user_resp = await fetch(
                             "https://discord.com/api/users/@me/guilds",
                             headers={"Authorization": f"Bearer {user_access_token}"}
                         )
-                        if not guilds_resp.ok:
-                            try:
-                                t = await guilds_resp.text()
-                            except Exception:
-                                t = ""
-                            print("Failed to fetch user guilds:", t)
-                            try:
-                                await guilds_resp.body.cancel()
-                            except Exception:
-                                pass
-                            body, status, headers = json_response({"error": "Failed to fetch user guilds", "details": t, "hint": "token_maybe_expired"}, 500, allowed_origin)
+                        if not user_resp.ok:
+                            t = await user_resp.text()
+                            body, status, headers = json_response({"error": "Failed to fetch user guilds", "details": t}, 500, allowed_origin)
                             return Response(body, status=status, headers=headers)
-                        guilds = await guilds_resp.json()
+                        user_guilds = await user_resp.json()
 
-                        out = []
+                        # 2️⃣ Гильдии бота (ОДИН запрос)
+                        bot_resp = await fetch(
+                            "https://discord.com/api/users/@me/guilds",
+                            headers={"Authorization": f"Bot {BOT_TOKEN}"}
+                        )
+
+                        bot_guild_ids = set()
+                        if bot_resp.ok:
+                            bot_guilds = await bot_resp.json()
+                            bot_guild_ids = {g["id"] for g in bot_guilds}
+                        else:
+                            await bot_resp.body.cancel()
+
                         admin_bit = PERMISSION_BITS["ADMINISTRATOR"]
+                        out = []
 
-                        import asyncio
-                        bot_tasks = []
-                        for g in guilds:
+                        for g in user_guilds:
                             perms = int(g.get("permissions", 0))
                             if (perms & admin_bit) == 0:
-                                continue  # пропускаем гильдии, где пользователь не админ
+                                continue
+
                             g_id = g.get("id")
-                            if CLIENT_ID:
-                                url = f"https://discord.com/api/guilds/{g_id}/members/{CLIENT_ID}"
-                                bot_tasks.append(fetch(url, headers={"Authorization": f"Bot {BOT_TOKEN}"}))
-                            else:
-                                bot_tasks.append(None)
+                            icon = g.get("icon")
 
-                        bot_responses = await asyncio.gather(*[t for t in bot_tasks if t is not None], return_exceptions=True)
-                        bot_index = 0
-
-                        for g in guilds:
-                            perms = int(g.get("permissions", 0))
-                            if (perms & admin_bit) == 0:
-                                continue  # фильтруем на всякий случай
-                            g_id = g.get("id")
-                            bot_present = False
-
-                            if CLIENT_ID:
-                                resp = bot_responses[bot_index]
-                                bot_index += 1
-                                try:
-                                    if getattr(resp, "ok", False):
-                                        await resp.json()
-                                        bot_present = True
-                                    else:
-                                        try:
-                                            await resp.body.cancel()
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    bot_present = False
+                            icon_url = None
+                            if icon:
+                                icon_url = f"https://cdn.discordapp.com/icons/{g_id}/{icon}.png"
 
                             out.append({
                                 "id": g_id,
                                 "name": g.get("name"),
-                                "permissions": perms,
                                 "isAdmin": True,
-                                "botPresent": bot_present,
-                                "icon": g.get("icon")  # добавляем аватар гильдии
+                                "botPresent": g_id in bot_guild_ids,
+                                "icon": icon,
+                                "iconUrl": icon_url
                             })
 
                         body, status, headers = json_response({"guilds": out}, 200, allowed_origin)
                         return Response(body, status=status, headers=headers)
-         
+        
 
             # ===== /action =====
             if path == "/action":

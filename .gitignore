@@ -71,3 +71,4 @@ python_modules/
 .venv/
 .venv-workers/
 .directory
+s.js
