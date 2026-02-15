@@ -17,7 +17,6 @@ import urllib.parse
 import time
 import os
 import json
-
 import hashlib
 import hmac
 # import DB helper
@@ -27,13 +26,20 @@ from urllib.parse import urlparse, parse_qs, urlencode
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
         # ===== ENV (read from worker env or fallback to os.environ) =====
-
-        CLIENT_SECRET = self.env.DISCORD_CLIENT_SECRET
-        BOT_TOKEN = self.env.BOT_TOKEN
-        JWT_SECRET = self.env.JWT_SECRET
-        BOT_ID = self.env, "BOT_ID"
-        SUPABASE_URL = self.env, "SUPABASE_URL"
-        SUPABASE_SERVICE_KEY = self.env, "SUPABASE_SERVICE_KEY"
+        try:
+            CLIENT_SECRET = getattr(self.env, "DISCORD_CLIENT_SECRET", None)
+            BOT_TOKEN = getattr(self.env, "BOT_TOKEN", None)
+            JWT_SECRET = getattr(self.env, "JWT_SECRET", None)
+            BOT_ID = getattr(self.env, "BOT_ID", None)
+            SUPABASE_URL = getattr(self.env, "SUPABASE_URL", None)
+            SUPABASE_SERVICE_KEY = getattr(self.env, "SUPABASE_SERVICE_KEY", None)
+        except Exception:
+            CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
+            BOT_TOKEN = os.environ.get("BOT_TOKEN")
+            JWT_SECRET = os.environ.get("JWT_SECRET")
+            BOT_ID = os.environ.get("BOT_ID")
+            SUPABASE_URL = os.environ.get("SUPABASE_URL")
+            SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
         if not CLIENT_SECRET or not BOT_TOKEN or not JWT_SECRET:
             return Response("Server misconfigured: missing secrets", status=500)
@@ -43,10 +49,12 @@ class Default(WorkerEntrypoint):
         use_kv_fallback = False
         if SUPABASE_URL and SUPABASE_SERVICE_KEY:
             try:
+                # SupabaseDB implementation may accept env or url/key; pass what you need
                 db = SupabaseDB(self.env)
             except Exception as e:
                 print("Supabase init failed, will fallback to KV if available:", e)
                 db = None
+                use_kv_fallback = True
         else:
             # no supabase configured -> we'll use KV fallback
             use_kv_fallback = True
@@ -86,10 +94,15 @@ class Default(WorkerEntrypoint):
             return None, None
 
         async def _db_store_token(user_id: str, token_json_obj: dict) -> bool:
+            # low-level DB store using SUPABASE_URL endpoint
             if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
                 return False
             body_bytes = json.dumps({"user_id": user_id, "token_json": token_json_obj}).encode()
-            sig_hex = hmac.new(SUPABASE_SERVICE_KEY.encode(), body_bytes, hashlib.sha256).hexdigest()
+            try:
+                sig_hex = hmac.new(SUPABASE_SERVICE_KEY.encode(), body_bytes, hashlib.sha256).hexdigest()
+            except Exception as e:
+                print("SUPABASE_SERVICE_KEY invalid:", e)
+                return False
             try:
                 resp = await fetch(
                     f"{SUPABASE_URL.rstrip('/')}/token",
@@ -98,7 +111,10 @@ class Default(WorkerEntrypoint):
                     body=body_bytes,
                 )
                 # обязательно читать тело или отменять
-                await resp.text()
+                try:
+                    await resp.text()
+                except Exception:
+                    pass
                 return resp.status == 200
             except Exception as e:
                 print("db store fetch failed:", e)
@@ -109,7 +125,11 @@ class Default(WorkerEntrypoint):
             if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
                 return None
             msg = f"GET:{user_id}".encode()
-            sig_hex = hmac.new(SUPABASE_SERVICE_KEY.encode(), msg, hashlib.sha256).hexdigest()
+            try:
+                sig_hex = hmac.new(SUPABASE_SERVICE_KEY.encode(), msg, hashlib.sha256).hexdigest()
+            except Exception as e:
+                print("SUPABASE_SERVICE_KEY invalid:", e)
+                return None
             try:
                 resp = await fetch(
                     f"{SUPABASE_URL.rstrip('/')}/token/{urllib.parse.quote(user_id)}",
@@ -120,18 +140,34 @@ class Default(WorkerEntrypoint):
                     j = await resp.json()
                     return j.get("token_json")
                 else:
-                    await resp.text()  # читаем тело, чтобы не было stalled response
+                    # читаем тело, чтобы не было stalled response
+                    try:
+                        await resp.text()
+                    except Exception:
+                        pass
                     return None
             except Exception as e:
                 print("db get fetch failed:", e)
                 return None
-        # helper: store token (tries Supabase, then KV)
+
+        # helper: store token (tries Supabase via db helper, then KV)
         async def store_token(user_id, token_json):
+            # prefer using Supabase client wrapper if available
             if db:
-                ok = await db.save_token(user_id, token_json)
-                if ok:
-                    return True, "supabase"
-            # fallback to KV
+                try:
+                    ok = await db.save_token(user_id, token_json)
+                    if ok:
+                        return True, "supabase"
+                except Exception as e:
+                    print("Supabase.save_token failed:", e)
+            # low-level store via SUPABASE REST endpoint as fallback
+            try:
+                low_ok = await _db_store_token(user_id, token_json)
+                if low_ok:
+                    return True, "supabase_rest"
+            except Exception as e:
+                print("low-level db store failed:", e)
+            # KV fallback
             kv_ok, kv_name = await _kv_put(f"user:{user_id}", json.dumps(token_json))
             if kv_ok:
                 return True, kv_name
@@ -143,17 +179,17 @@ class Default(WorkerEntrypoint):
                 try:
                     rec = await db.get_token(user_id)
                     if rec:
-                        # make shape compatible with token_json used earlier
-                        return {
-                            "access_token": rec.get("access_token"),
-                            "refresh_token": rec.get("refresh_token")
-                        }
+                        # normalize shape: if db wrapper returns dict with fields
+                        return rec
                 except Exception as e:
                     print("Supabase get_token failed:", e)
             # KV fallback
             kv_val, kv_name = await _kv_get(f"user:{user_id}")
             if kv_val:
-                return json.loads(kv_val)
+                try:
+                    return json.loads(kv_val)
+                except Exception:
+                    return None
             return None
 
         try:
@@ -217,7 +253,10 @@ class Default(WorkerEntrypoint):
                             except Exception:
                                 t = "<failed to read body>"
                             print("Token exchange failed:", t)
-                            await token_resp.body.cancel()
+                            try:
+                                await token_resp.body.cancel()
+                            except Exception:
+                                pass
                             body, status, headers = json_response({"error": "Token exchange failed", "details": t}, 502, allowed_origin)
                             return Response(body, status=status, headers=headers)
 
@@ -244,7 +283,10 @@ class Default(WorkerEntrypoint):
                             except Exception:
                                 t = "<failed to read user body>"
                             print("Failed to fetch user:", t)
-                            await user_resp.body.cancel()
+                            try:
+                                await user_resp.body.cancel()
+                            except Exception:
+                                pass
                             body, status, headers = json_response({"error": "User fetch failed"}, 502, allowed_origin)
                             return Response(body, status=status, headers=headers)
 
@@ -255,13 +297,18 @@ class Default(WorkerEntrypoint):
                             body, status, headers = json_response({"error": "Invalid user response"}, 502, allowed_origin)
                             return Response(body, status=status, headers=headers)
 
-                        # store token safely
+                        # store token safely via unified helper (prefers supabase wrapper -> rest -> kv)
                         saved_ok = False
                         saved_name = None
                         try:
                             user_id = user.get("id")
                             if user_id:
-                                saved_ok = await _db_store_token(user_id, token_json)
+                                res = await store_token(user_id, token_json)
+                                if isinstance(res, tuple):
+                                    saved_ok = bool(res[0])
+                                    saved_name = res[1] if len(res) > 1 else None
+                                else:
+                                    saved_ok = bool(res)
                         except Exception as e:
                             print("DB store exception:", e)
                             saved_ok = False
@@ -387,7 +434,10 @@ class Default(WorkerEntrypoint):
                             except Exception:
                                 t = ""
                             print("Failed to fetch user guilds:", t)
-                            await guilds_resp.body.cancel()
+                            try:
+                                await guilds_resp.body.cancel()
+                            except Exception:
+                                pass
                             body, status, headers = json_response({"error": "Failed to fetch user guilds", "details": t, "hint": "token_maybe_expired"}, 500, allowed_origin)
                             return Response(body, status=status, headers=headers)
                         guilds = await guilds_resp.json()
@@ -418,11 +468,14 @@ class Default(WorkerEntrypoint):
                                 resp = bot_responses[bot_index]
                                 bot_index += 1
                                 try:
-                                    if resp.ok:
+                                    if getattr(resp, "ok", False):
                                         await resp.json()
                                         bot_present = True
                                     else:
-                                        await resp.body.cancel()
+                                        try:
+                                            await resp.body.cancel()
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     bot_present = False
 
