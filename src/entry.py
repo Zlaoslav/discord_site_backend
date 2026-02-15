@@ -94,10 +94,19 @@ class Default(WorkerEntrypoint):
             return None, None
 
         async def _db_store_token(user_id: str, token_json_obj: dict) -> bool:
-            # low-level DB store using SUPABASE_URL endpoint
+            # low-level store to SUPABASE REST endpoint; ensures expires_at is set
             if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
                 return False
-            body_bytes = json.dumps({"user_id": user_id, "token_json": token_json_obj}).encode()
+            # normalize token and compute expires_at if possible
+            token_copy = dict(token_json_obj)
+            try:
+                expires_in = int(token_copy.get("expires_in", 0) or 0)
+            except Exception:
+                expires_in = 0
+            if expires_in and not token_copy.get("expires_at"):
+                token_copy["expires_at"] = int(time.time()) + expires_in
+            payload = {"user_id": user_id, "token_json": token_copy}
+            body_bytes = json.dumps(payload).encode()
             try:
                 sig_hex = hmac.new(SUPABASE_SERVICE_KEY.encode(), body_bytes, hashlib.sha256).hexdigest()
             except Exception as e:
@@ -110,18 +119,20 @@ class Default(WorkerEntrypoint):
                     headers={"Content-Type": "application/json", "X-Service-Sign": sig_hex},
                     body=body_bytes,
                 )
-                # обязательно читать тело или отменять
                 try:
                     await resp.text()
                 except Exception:
                     pass
-                return resp.status == 200
+                if resp.status == 200:
+                    return True
+                print("Supabase store returned status", resp.status)
+                return False
             except Exception as e:
                 print("db store fetch failed:", e)
                 return False
 
-        # === helper: DB get ===
         async def _db_get_token(user_id: str):
+            # low-level get from SUPABASE REST endpoint; returns token_json dict or None
             if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
                 return None
             msg = f"GET:{user_id}".encode()
@@ -136,61 +147,191 @@ class Default(WorkerEntrypoint):
                     method="GET",
                     headers={"X-Service-Sign": sig_hex},
                 )
-                if resp.status == 200:
-                    j = await resp.json()
-                    return j.get("token_json")
-                else:
-                    # читаем тело, чтобы не было stalled response
-                    try:
-                        await resp.text()
-                    except Exception:
-                        pass
-                    return None
             except Exception as e:
                 print("db get fetch failed:", e)
                 return None
+            # if non-200, read body then return None
+            if resp.status != 200:
+                try:
+                    txt = await resp.text()
+                    print("Supabase get non-200:", resp.status, txt)
+                except Exception:
+                    pass
+                return None
+            try:
+                j = await resp.json()
+            except Exception as e:
+                print("Failed to parse DB response JSON:", e)
+                try:
+                    await resp.text()
+                except Exception:
+                    pass
+                return None
+            # normalize: possible shapes:
+            # 1) {"token_json": {...}}
+            # 2) {"data": [{ "token_json": {...} }]} or {"data": {...}}
+            # 3) direct token object
+            if isinstance(j, dict):
+                if "token_json" in j and isinstance(j["token_json"], (dict, str)):
+                    return j["token_json"]
+                if "data" in j:
+                    data = j["data"]
+                    if isinstance(data, list) and data:
+                        first = data[0]
+                        if isinstance(first, dict) and "token_json" in first:
+                            return first["token_json"]
+                        return first
+                    if isinstance(data, dict):
+                        if "token_json" in data:
+                            return data["token_json"]
+                        return data
+            # fallback: return whatever we got
+            return j
 
-        # helper: store token (tries Supabase via db helper, then KV)
+        async def _refresh_user_token(user_id: str, stored_token: dict):
+            # try to refresh using refresh_token; returns new token_json dict or None
+            refresh = stored_token.get("refresh_token")
+            if not refresh:
+                return None
+            body = urllib.parse.urlencode({
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+            }).encode()
+            try:
+                resp = await fetch(
+                    "https://discord.com/api/oauth2/token",
+                    method="POST",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    body=body,
+                )
+            except Exception as e:
+                print("Refresh token request failed:", e)
+                return None
+            if not resp.ok:
+                try:
+                    txt = await resp.text()
+                except Exception:
+                    txt = ""
+                print("Refresh token failed:", resp.status, txt)
+                try:
+                    await resp.body.cancel()
+                except Exception:
+                    pass
+                return None
+            try:
+                new_tok = await resp.json()
+            except Exception as e:
+                print("Failed to parse refresh response:", e)
+                return None
+            # compute expires_at
+            try:
+                expires_in = int(new_tok.get("expires_in", 0) or 0)
+            except Exception:
+                expires_in = 0
+            if expires_in and not new_tok.get("expires_at"):
+                new_tok["expires_at"] = int(time.time()) + expires_in
+            # keep refresh_token if provider didn't return new one
+            if not new_tok.get("refresh_token") and stored_token.get("refresh_token"):
+                new_tok["refresh_token"] = stored_token.get("refresh_token")
+            # persist updated token
+            try:
+                ok, where = await store_token(user_id, new_tok)
+                if ok:
+                    return new_tok
+            except Exception as e:
+                print("Failed to persist refreshed token:", e)
+            return new_tok
+
         async def store_token(user_id, token_json):
-            # prefer using Supabase client wrapper if available
+            # prefer wrapper 'db' if available
             if db:
                 try:
                     ok = await db.save_token(user_id, token_json)
                     if ok:
-                        return True, "supabase"
+                        return True, "supabase_wrapper"
                 except Exception as e:
-                    print("Supabase.save_token failed:", e)
-            # low-level store via SUPABASE REST endpoint as fallback
+                    print("Supabase wrapper save_token failed:", e)
+            # try low-level REST store
             try:
-                low_ok = await _db_store_token(user_id, token_json)
-                if low_ok:
+                ok = await _db_store_token(user_id, token_json)
+                if ok:
                     return True, "supabase_rest"
             except Exception as e:
-                print("low-level db store failed:", e)
+                print("Low-level db store failed:", e)
             # KV fallback
-            kv_ok, kv_name = await _kv_put(f"user:{user_id}", json.dumps(token_json))
-            if kv_ok:
-                return True, kv_name
+            try:
+                kv_ok, kv_name = await _kv_put(f"user:{user_id}", json.dumps(token_json))
+                if kv_ok:
+                    return True, kv_name
+            except Exception as e:
+                print("KV fallback put failed:", e)
             return False, None
 
-        # helper: get token (Supabase then KV)
         async def get_stored_token(user_id):
+            # prefer wrapper
+            stored = None
             if db:
                 try:
                     rec = await db.get_token(user_id)
                     if rec:
-                        # normalize shape: if db wrapper returns dict with fields
-                        return rec
+                        stored = rec
                 except Exception as e:
-                    print("Supabase get_token failed:", e)
-            # KV fallback
-            kv_val, kv_name = await _kv_get(f"user:{user_id}")
-            if kv_val:
+                    print("Supabase wrapper get_token failed:", e)
+                    stored = None
+            # low-level REST
+            if stored is None:
                 try:
-                    return json.loads(kv_val)
+                    low = await _db_get_token(user_id)
+                    if low:
+                        stored = low
+                except Exception as e:
+                    print("Low-level db get failed:", e)
+                    stored = None
+            # KV fallback
+            if stored is None:
+                try:
+                    kv_val, kv_name = await _kv_get(f"user:{user_id}")
+                    if kv_val:
+                        try:
+                            stored = json.loads(kv_val)
+                        except Exception:
+                            stored = kv_val
+                except Exception as e:
+                    print("KV fallback read failed:", e)
+                    stored = None
+            if not stored:
+                return None
+            # Normalize: if stored is dict-like or JSON string already loaded
+            if isinstance(stored, str):
+                try:
+                    token_json = json.loads(stored)
                 except Exception:
                     return None
-            return None
+            elif isinstance(stored, dict):
+                # In some DB shapes token is under "token_json"
+                if "token_json" in stored and isinstance(stored["token_json"], (dict, str)):
+                    token_json = stored["token_json"] if isinstance(stored["token_json"], dict) else json.loads(stored["token_json"])
+                else:
+                    token_json = stored
+            else:
+                # unknown shape
+                return None
+            # check expiry and refresh if needed
+            try:
+                exp = int(token_json.get("expires_at") or 0)
+            except Exception:
+                exp = 0
+            now_ts = int(time.time())
+            if exp and exp <= now_ts:
+                # expired -> try refresh
+                refreshed = await _refresh_user_token(user_id, token_json)
+                if refreshed:
+                    return refreshed
+                # if refresh failed, return existing token (caller will likely reject)
+                return token_json
+            return token_json
 
         try:
             # ===== root =====
@@ -386,37 +527,14 @@ class Default(WorkerEntrypoint):
 
                         user_id = payload["sub"]
 
-                        stored = None
-                        try:
-                            stored = await _db_get_token(user_id)
-                        except Exception as e:
-                            print("DB read failed:", e)
-                            stored = None
-
-                        if not stored:
-                            try:
-                                kv_stored, kv_name = await _kv_get(f"user:{user_id}")
-                                if kv_stored:
-                                    stored = kv_stored
-                            except Exception as e:
-                                print("KV fallback read failed:", e)
-
-                        if not stored:
+                        # =====> используем get_stored_token вместо _db_get_token / KV
+                        token_json = await get_stored_token(user_id)
+                        if not token_json:
                             body, status, headers = json_response(
                                 {"error": "No oauth tokens stored", "reason": "no_oauth_tokens", "hint": "Re-authorize or ensure DB service accessible"},
                                 403,
                                 allowed_origin
                             )
-                            return Response(body, status=status, headers=headers)
-
-                        try:
-                            if isinstance(stored, str):
-                                token_json = json.loads(stored)
-                            else:
-                                token_json = stored
-                        except Exception as e:
-                            print("Failed to parse stored token JSON:", e)
-                            body, status, headers = json_response({"error": "Invalid stored token"}, 500, allowed_origin)
                             return Response(body, status=status, headers=headers)
 
                         user_access_token = token_json.get("access_token")
@@ -489,7 +607,7 @@ class Default(WorkerEntrypoint):
 
                         body, status, headers = json_response({"guilds": out}, 200, allowed_origin)
                         return Response(body, status=status, headers=headers)
-            
+          
 
             # ===== /action =====
             if path == "/action":
