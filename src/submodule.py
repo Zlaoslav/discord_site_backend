@@ -9,10 +9,10 @@ import urllib.parse
 
 CLIENT_ID = "1409084528588488727"
 REDIRECT_URI = "https://pollpi.slavi.workers.dev/callback"
-FRONTEND_URL = "https://zlaoslav.github.io/discord_site_frontend/"
+FRONTEND_URL = "https://https://pollpi.dpdns.org/"
 
 ALLOWED_ORIGINS = [
-    "https://zlaoslav.github.io",
+    "https://pollpi.dpdns.org/",
     "https://pollpi.slavi.workers.dev",
     "http://localhost:5173",
 ]
