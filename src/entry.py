@@ -20,6 +20,7 @@ import json
 
 # import DB helper
 from database import SupabaseDB
+from urllib.parse import urlparse, parse_qs, urlencode
 
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
@@ -140,125 +141,94 @@ class Default(WorkerEntrypoint):
 
             # ===== /callback =====
             if path == "/callback":
-                qs = urllib.parse.parse_qs(parsed.query)
-                code = qs.get("code", [None])[0]
-                state = qs.get("state", [None])[0]
-                cookies = parse_cookies(request.headers.get("Cookie"))
-                if not code or cookies.get("oauth_state") != state:
-                    body, status, headers = json_response({"error": "Invalid state or code"}, 400, origin_for_cors)
-                    return Response(body, status=status, headers=headers)
+                        try:
+                            # --- 1. Получаем code ---
+                            query = parse_qs(parsed.query)
+                            code = query.get("code", [None])[0]
 
-                form_data = urllib.parse.urlencode({
-                    "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET,
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": REDIRECT_URI,
-                })
+                            if not code:
+                                return Response("Missing code", status=400)
 
-                try:
-                    token_resp = await fetch(
-                        "https://discord.com/api/oauth2/token",
-                        method="POST",
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        body=form_data.encode()
-                    )
-                except Exception as e:
-                    print("Token exchange fetch exception:", e)
-                    body, status, headers = json_response({"error": "Token exchange request failed"}, 502, origin_for_cors)
-                    return Response(body, status=status, headers=headers)
+                            # --- 2. Обмен кода на токен ---
+                            body = urlencode({
+                                "client_id": CLIENT_ID,
+                                "client_secret": CLIENT_SECRET,
+                                "grant_type": "authorization_code",
+                                "code": code,
+                                "redirect_uri": REDIRECT_URI,
+                            })
 
-                if not token_resp.ok:
-                    try:
-                        t = await token_resp.text()
-                    except Exception:
-                        t = "<failed to read body>"
-                    print("Token exchange failed:", t)
-                    body, status, headers = json_response({"error": "Token exchange failed", "details": t}, 502, origin_for_cors)
-                    return Response(body, status=status, headers=headers)
+                            token_resp = await fetch(
+                                "https://discord.com/api/oauth2/token",
+                                {
+                                    "method": "POST",
+                                    "headers": {
+                                        "Content-Type": "application/x-www-form-urlencoded"
+                                    },
+                                    "body": body
+                                }
+                            )
 
-                try:
-                    token_json = await token_resp.json()
-                except Exception as e:
-                    print("Failed to parse token response JSON:", e)
-                    body, status, headers = json_response({"error": "Invalid token response"}, 502, origin_for_cors)
-                    return Response(body, status=status, headers=headers)
+                            if token_resp.status != 200:
+                                err = await token_resp.text()
+                                print("Token exchange failed:", err)
+                                return Response("Token exchange failed", status=500)
 
-                # fetch user
-                try:
-                    user_resp = await fetch(
-                        "https://discord.com/api/users/@me",
-                        headers={"Authorization": f"Bearer {token_json.get('access_token')}"}
-                    )
-                except Exception as e:
-                    print("User fetch request failed:", e)
-                    body, status, headers = json_response({"error": "Failed to fetch user"}, 502, origin_for_cors)
-                    return Response(body, status=status, headers=headers)
+                            token_json = await token_resp.json()
+                            access_token = token_json.get("access_token")
 
-                if not user_resp.ok:
-                    try:
-                        t = await user_resp.text()
-                    except Exception:
-                        t = "<failed to read user body>"
-                    print("Failed to fetch user:", t)
-                    body, status, headers = json_response({"error": "User fetch failed"}, 502, origin_for_cors)
-                    return Response(body, status=status, headers=headers)
+                            if not access_token:
+                                return Response("No access token", status=500)
 
-                try:
-                    user = await user_resp.json()
-                except Exception as e:
-                    print("Failed to parse user JSON:", e)
-                    body, status, headers = json_response({"error": "Invalid user response"}, 502, origin_for_cors)
-                    return Response(body, status=status, headers=headers)
+                            # --- 3. Получаем пользователя ---
+                            user_resp = await fetch(
+                                "https://discord.com/api/users/@me",
+                                {
+                                    "headers": {
+                                        "Authorization": f"Bearer {access_token}"
+                                    }
+                                }
+                            )
 
-                # store tokens (Supabase preferred, KV fallback)
-                saved_ok, saved_here = await (await store_token(user.get("id"), token_json) if True else (False, None))
-                # note: store_token returns (bool, source) but we wrapped earlier to return (bool,source)
-                # in our helper, it returns (True,"supabase") or (True,"OAUTH_TOKENS") or (False,None)
-                # For simplicity above `store_token` returns tuple; ensure call matches:
-                if isinstance(saved_ok, tuple):
-                    # accidental double-wrapped call, normalize
-                    saved_ok, saved_here = saved_ok
-                # but our implementation returns tuple from store_token; so actual values set.
+                            if user_resp.status != 200:
+                                err = await user_resp.text()
+                                print("User fetch failed:", err)
+                                return Response("User fetch failed", status=500)
 
-                # However to be safe, recompute:
-                try:
-                    # attempt storing properly with helper
-                    saved_res = await store_token(user.get("id"), token_json)
-                    if isinstance(saved_res, tuple):
-                        saved_ok, saved_here = saved_res
-                    else:
-                        # compatibility
-                        saved_ok = bool(saved_res)
-                        saved_here = "supabase" if db else "kv"
-                except Exception as e:
-                    print("store_token call failed:", e)
-                    saved_ok = False
-                    saved_here = None
+                            user = await user_resp.json()
+                            user_id = user.get("id")
 
-                debug_cookie = "oauth_saved=yes" if saved_ok else "oauth_saved=no"
+                            if not user_id:
+                                return Response("Invalid user data", status=500)
 
-                # create jwt
-                now = int(time.time())
-                jwt = sign_jwt({
-                    "sub": user["id"],
-                    "username": user.get("username"),
-                    "discriminator": user.get("discriminator"),
-                    "avatar": user.get("avatar"),
-                    "iat": now,
-                    "exp": now + 86400,
-                }, JWT_SECRET)
+                            # --- 4. Сохраняем токен ---
+                            saved_ok = False
 
-                redirect_to = FRONTEND_URL + "#token=" + urllib.parse.quote(jwt, safe='')
-                session_cookie = f"session={jwt}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=86400"
+                            try:
+                                result = await store_token(user_id, token_json)
 
-                headers = {
-                    "Location": redirect_to,
-                    "Set-Cookie": session_cookie,
-                    "X-OAuth-Saved": debug_cookie
-                }
-                headers.update(cors_headers(origin_for_cors))
-                return Response(None, status=302, headers=headers)
+                                if isinstance(result, tuple):
+                                    saved_ok = bool(result[0])
+                                else:
+                                    saved_ok = bool(result)
+
+                            except Exception as e:
+                                print("store_token error:", e)
+
+                            if not saved_ok:
+                                return Response("Failed to save token", status=500)
+
+                            # --- 5. Ставим cookie ---
+                            headers = {
+                                "Set-Cookie": f"session={user_id}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=604800",
+                                "Location": "/dashboard"
+                            }
+
+                            return Response(None, status=302, headers=headers)
+
+                        except Exception as e:
+                            print("Callback crash:", str(e))
+                            return Response("Internal error", status=500)
 
             # ===== /me =====
             if path == "/me":
