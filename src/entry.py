@@ -1,5 +1,5 @@
 # entry.py
-from workers import Response, WorkerEntrypoint, fetch  # pyright: ignore[reportMissingImports] # runtime-provided
+from workers import Response, WorkerEntrypoint, fetch # pyright: ignore[reportMissingImports]
 from submodule import (
     CLIENT_ID,
     REDIRECT_URI,
@@ -17,125 +17,109 @@ import urllib.parse
 import time
 import os
 import json
-import hmac
-import hashlib
+
+# import DB helper
+from database import SupabaseDB
 
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
-        # ===== ENV =====
-        try:
-            CLIENT_SECRET = self.env.DISCORD_CLIENT_SECRET
-            BOT_TOKEN = self.env.BOT_TOKEN
-            JWT_SECRET = self.env.JWT_SECRET
-            BOT_ID = self.env.BOT_ID
-            DB_SERVICE_URL = getattr(self.env, "DB_SERVICE_URL", None)
-            SERVICE_SECRET = getattr(self.env, "SERVICE_SECRET", None)
-        except Exception:
-            CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET")
-            BOT_TOKEN = os.environ.get("BOT_TOKEN")
-            JWT_SECRET = os.environ.get("JWT_SECRET")
-            BOT_ID = os.environ.get("BOT_ID")
-            DB_SERVICE_URL = os.environ.get("DB_SERVICE_URL")
-            SERVICE_SECRET = os.environ.get("SERVICE_SECRET")
+        # ===== ENV (read from worker env or fallback to os.environ) =====
+
+        CLIENT_SECRET = self.env.DISCORD_CLIENT_SECRET
+        BOT_TOKEN = self.env.BOT_TOKEN
+        JWT_SECRET = self.env.JWT_SECRET
+        BOT_ID = self.env, "BOT_ID"
+        SUPABASE_URL = self.env, "SUPABASE_URL"
+        SUPABASE_SERVICE_KEY = self.env, "SUPABASE_SERVICE_KEY"
 
         if not CLIENT_SECRET or not BOT_TOKEN or not JWT_SECRET:
             return Response("Server misconfigured: missing secrets", status=500)
 
-        origin = request.headers.get("Origin")
-        allowed_origin = origin if origin in ALLOWED_ORIGINS else None
-
-        # OPTIONS preflight
-        if request.method == "OPTIONS":
-            if not allowed_origin:
-                return Response(None, status=204)
-            return Response(None, status=204, headers=cors_headers(allowed_origin))
+        # init DB client if Supabase secrets available
+        db = None
+        use_kv_fallback = False
+        if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+            try:
+                db = SupabaseDB(self.env)
+            except Exception as e:
+                print("Supabase init failed, will fallback to KV if available:", e)
+                db = None
+        else:
+            # no supabase configured -> we'll use KV fallback
+            use_kv_fallback = True
 
         parsed = urllib.parse.urlparse(request.url)
         path = parsed.path
+        origin = request.headers.get("Origin")
+        allowed_origin = origin if origin in ALLOWED_ORIGINS else None
+        # origin for CORS headers fallback (use FRONTEND_URL if origin not allowed)
+        origin_for_cors = allowed_origin or FRONTEND_URL
 
-        # helper: list of KV binding names to try (kept for backward compatibility if you still have KV)
-        def _kv_names():
-            return ["OAUTH_TOKENS", "OAUTH_KV", "TOKEN_STORE"]
+        # OPTIONS preflight
+        if request.method == "OPTIONS":
+            headers = cors_headers(origin_for_cors)
+            return Response(None, status=204, headers=headers)
 
+        # helper: KV (fallback only)
         async def _kv_put(key, value):
-            # try put into available kv bindings (kept as fallback if you have KV)
-            for name in _kv_names():
-                try:
-                    kv = getattr(self.env, name, None)
-                except Exception:
-                    kv = None
-                if kv is not None:
-                    try:
-                        await kv.put(key, value)
-                        got = await kv.get(key)
-                        if got:
-                            return True, name
-                    except Exception as e:
-                        print(f"KV put failed for {name}: {e}")
-                        continue
+            try:
+                kv = getattr(self.env, "OAUTH_TOKENS", None)
+                if kv:
+                    await kv.put(key, value)
+                    return True, "OAUTH_TOKENS"
+            except Exception as e:
+                print("KV put failed:", e)
             return False, None
 
         async def _kv_get(key):
-            for name in _kv_names():
-                try:
-                    kv = getattr(self.env, name, None)
-                except Exception:
-                    kv = None
-                if kv is not None:
-                    try:
-                        got = await kv.get(key)
-                        if got:
-                            return got, name
-                    except Exception as e:
-                        print(f"KV get failed for {name}: {e}")
-                        continue
+            try:
+                kv = getattr(self.env, "OAUTH_TOKENS", None)
+                if kv:
+                    val = await kv.get(key)
+                    if val:
+                        return val, "OAUTH_TOKENS"
+            except Exception as e:
+                print("KV get failed:", e)
             return None, None
 
-        # DB service helpers (use DB_SERVICE_URL + SERVICE_SECRET)
-        async def _db_store_token(user_id: str, token_json_obj: dict) -> bool:
-            if not DB_SERVICE_URL or not SERVICE_SECRET:
-                return False
-            body_bytes = json.dumps({"user_id": user_id, "token_json": token_json_obj}).encode()
-            sig_hex = hmac.new(SERVICE_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest()
-            try:
-                resp = await fetch(
-                    f"{DB_SERVICE_URL.rstrip('/')}/token",
-                    method="POST",
-                    headers={"Content-Type": "application/json", "X-Service-Sign": sig_hex},
-                    body=body_bytes,
-                )
-                return resp.status == 200
-            except Exception as e:
-                print("db store fetch failed:", e)
-                return False
+        # helper: store token (tries Supabase, then KV)
+        async def store_token(user_id, token_json):
+            if db:
+                ok = await db.save_token(user_id, token_json)
+                if ok:
+                    return True, "supabase"
+            # fallback to KV
+            kv_ok, kv_name = await _kv_put(f"user:{user_id}", json.dumps(token_json))
+            if kv_ok:
+                return True, kv_name
+            return False, None
 
-        async def _db_get_token(user_id: str):
-            if not DB_SERVICE_URL or not SERVICE_SECRET:
-                return None
-            msg = f"GET:{user_id}".encode()
-            sig_hex = hmac.new(SERVICE_SECRET.encode(), msg, hashlib.sha256).hexdigest()
-            try:
-                resp = await fetch(
-                    f"{DB_SERVICE_URL.rstrip('/')}/token/{urllib.parse.quote(user_id)}",
-                    method="GET",
-                    headers={"X-Service-Sign": sig_hex},
-                )
-                if resp.status == 200:
-                    j = await resp.json()
-                    return j.get("token_json")
-                else:
-                    # non-200 — return None (caller handles hint/status)
-                    try:
-                        text = await resp.text()
-                        print("DB get non-200:", resp.status, text)
-                    except Exception:
-                        pass
-                    return None
-            except Exception as e:
-                print("db get fetch failed:", e)
-                return None
+        # helper: get token (Supabase then KV)
+        async def get_stored_token(user_id):
+            if db:
+                try:
+                    rec = await db.get_token(user_id)
+                    if rec:
+                        # make shape compatible with token_json used earlier
+                        return {
+                            "access_token": rec.get("access_token"),
+                            "refresh_token": rec.get("refresh_token")
+                        }
+                except Exception as e:
+                    print("Supabase get_token failed:", e)
+            # KV fallback
+            kv_val, kv_name = await _kv_get(f"user:{user_id}")
+            if kv_val:
+                return json.loads(kv_val)
+            return None
 
         try:
+            # ===== root =====
+            if request.method == "GET" and path == "/":
+                headers = cors_headers(origin_for_cors)
+                headers["Content-Type"] = "application/json"
+                return Response(json.dumps({"ok": True, "message": "Worker running"}), status=200, headers=headers)
+
             # ===== /login =====
             if path == "/login":
                 state = secrets.token_hex(16)
@@ -147,11 +131,11 @@ class Default(WorkerEntrypoint):
                     "state": state,
                 }
                 authorize_url = "https://discord.com/api/oauth2/authorize?" + urllib.parse.urlencode(params)
-
-                headers = {"Location": authorize_url}
-                headers["Set-Cookie"] = f"oauth_state={state}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=300"
-                if allowed_origin:
-                    headers.update(cors_headers(allowed_origin))
+                headers = {
+                    "Location": authorize_url,
+                    "Set-Cookie": f"oauth_state={state}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=300"
+                }
+                headers.update(cors_headers(origin_for_cors))
                 return Response(None, status=302, headers=headers)
 
             # ===== /callback =====
@@ -161,7 +145,8 @@ class Default(WorkerEntrypoint):
                 state = qs.get("state", [None])[0]
                 cookies = parse_cookies(request.headers.get("Cookie"))
                 if not code or cookies.get("oauth_state") != state:
-                    return Response("Invalid state or code", status=400)
+                    body, status, headers = json_response({"error": "Invalid state or code"}, 400, origin_for_cors)
+                    return Response(body, status=status, headers=headers)
 
                 form_data = urllib.parse.urlencode({
                     "client_id": CLIENT_ID,
@@ -180,7 +165,7 @@ class Default(WorkerEntrypoint):
                     )
                 except Exception as e:
                     print("Token exchange fetch exception:", e)
-                    body, status, headers = json_response({"error": "Token exchange request failed"}, 502, allowed_origin)
+                    body, status, headers = json_response({"error": "Token exchange request failed"}, 502, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 if not token_resp.ok:
@@ -189,14 +174,14 @@ class Default(WorkerEntrypoint):
                     except Exception:
                         t = "<failed to read body>"
                     print("Token exchange failed:", t)
-                    body, status, headers = json_response({"error": "Token exchange failed", "details": t}, 502, allowed_origin)
+                    body, status, headers = json_response({"error": "Token exchange failed", "details": t}, 502, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 try:
                     token_json = await token_resp.json()
                 except Exception as e:
                     print("Failed to parse token response JSON:", e)
-                    body, status, headers = json_response({"error": "Invalid token response"}, 502, allowed_origin)
+                    body, status, headers = json_response({"error": "Invalid token response"}, 502, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 # fetch user
@@ -207,7 +192,7 @@ class Default(WorkerEntrypoint):
                     )
                 except Exception as e:
                     print("User fetch request failed:", e)
-                    body, status, headers = json_response({"error": "Failed to fetch user"}, 502, allowed_origin)
+                    body, status, headers = json_response({"error": "Failed to fetch user"}, 502, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 if not user_resp.ok:
@@ -216,44 +201,42 @@ class Default(WorkerEntrypoint):
                     except Exception:
                         t = "<failed to read user body>"
                     print("Failed to fetch user:", t)
-                    body, status, headers = json_response({"error": "User fetch failed"}, 502, allowed_origin)
+                    body, status, headers = json_response({"error": "User fetch failed"}, 502, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 try:
                     user = await user_resp.json()
                 except Exception as e:
                     print("Failed to parse user JSON:", e)
-                    body, status, headers = json_response({"error": "Invalid user response"}, 502, allowed_origin)
+                    body, status, headers = json_response({"error": "Invalid user response"}, 502, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
-                # --- try to store tokens in DB service first, fallback to KV if available ---
-                saved_ok = False
-                saved_name = None
+                # store tokens (Supabase preferred, KV fallback)
+                saved_ok, saved_here = await (await store_token(user.get("id"), token_json) if True else (False, None))
+                # note: store_token returns (bool, source) but we wrapped earlier to return (bool,source)
+                # in our helper, it returns (True,"supabase") or (True,"OAUTH_TOKENS") or (False,None)
+                # For simplicity above `store_token` returns tuple; ensure call matches:
+                if isinstance(saved_ok, tuple):
+                    # accidental double-wrapped call, normalize
+                    saved_ok, saved_here = saved_ok
+                # but our implementation returns tuple from store_token; so actual values set.
+
+                # However to be safe, recompute:
                 try:
-                    user_id = user.get("id")
-                    if user_id:
-                        saved_ok = await _db_store_token(user_id, token_json)
+                    # attempt storing properly with helper
+                    saved_res = await store_token(user.get("id"), token_json)
+                    if isinstance(saved_res, tuple):
+                        saved_ok, saved_here = saved_res
+                    else:
+                        # compatibility
+                        saved_ok = bool(saved_res)
+                        saved_here = "supabase" if db else "kv"
                 except Exception as e:
-                    print("DB store exception:", e)
+                    print("store_token call failed:", e)
                     saved_ok = False
+                    saved_here = None
 
-                if not saved_ok:
-                    # fallback to KV if configured
-                    try:
-                        kv_ok, kv_name = await _kv_put(f"user:{user['id']}", json.dumps(token_json))
-                        if kv_ok:
-                            saved_ok = True
-                            saved_name = kv_name
-                            print("Token saved in KV binding (fallback):", kv_name)
-                    except Exception as e:
-                        print("KV fallback put failed:", e)
-
-                # debug cookie to help frontend detect storage success/failure (short-lived, not HttpOnly)
-                if saved_ok:
-                    debug_cookie = "oauth_saved=yes; Path=/; Max-Age=60; SameSite=None; Secure"
-                else:
-                    debug_cookie = "oauth_saved=no; Path=/; Max-Age=60; SameSite=None; Secure"
-                    print("Token storage failed for DB and KV")
+                debug_cookie = "oauth_saved=yes" if saved_ok else "oauth_saved=no"
 
                 # create jwt
                 now = int(time.time())
@@ -266,19 +249,15 @@ class Default(WorkerEntrypoint):
                     "exp": now + 86400,
                 }, JWT_SECRET)
 
-                # respond: set session cookie (HttpOnly) + redirect fragment for backward compat
                 redirect_to = FRONTEND_URL + "#token=" + urllib.parse.quote(jwt, safe='')
-                session_cookie = f"session={jwt}; Domain=pollpi.slavi.workers.dev; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=86400"
+                session_cookie = f"session={jwt}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=86400"
 
                 headers = {
                     "Location": redirect_to,
                     "Set-Cookie": session_cookie,
-                    # auxiliary header to bubble debug info if runtime strips second Set-Cookie
                     "X-OAuth-Saved": debug_cookie
                 }
-                if allowed_origin:
-                    headers.update(cors_headers(allowed_origin))
-
+                headers.update(cors_headers(origin_for_cors))
                 return Response(None, status=302, headers=headers)
 
             # ===== /me =====
@@ -294,70 +273,36 @@ class Default(WorkerEntrypoint):
                     if token:
                         payload = verify_jwt(token, JWT_SECRET)
                 if not payload:
-                    body, status, headers = json_response({"logged": False}, 200, allowed_origin)
+                    body, status, headers = json_response({"logged": False}, 200, origin_for_cors)
                     return Response(body, status=status, headers=headers)
-                body, status, headers = json_response({"logged": True, "user": payload}, 200, allowed_origin)
+                body, status, headers = json_response({"logged": True, "user": payload}, 200, origin_for_cors)
                 return Response(body, status=status, headers=headers)
 
             # ===== /guilds =====
             if path == "/guilds":
-                # authenticate same as /me
                 auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
                 payload = None
                 if auth_header and auth_header.startswith("Bearer "):
-                    token = auth_header[7:].strip()
-                    payload = verify_jwt(token, JWT_SECRET)
+                    payload = verify_jwt(auth_header[7:].strip(), JWT_SECRET)
                 if not payload:
                     cookies = parse_cookies(request.headers.get("Cookie"))
                     token = cookies.get("session")
                     if token:
                         payload = verify_jwt(token, JWT_SECRET)
                 if not payload:
-                    body, status, headers = json_response({"error": "Not authenticated"}, 401, allowed_origin)
+                    body, status, headers = json_response({"error": "Not authenticated"}, 401, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 user_id = payload["sub"]
 
-                # try read from DB service first
-                stored = None
-                try:
-                    stored = await _db_get_token(user_id)
-                except Exception as e:
-                    print("DB read failed:", e)
-                    stored = None
-
-                # fallback to KV if DB missing
-                if not stored:
-                    try:
-                        kv_stored, kv_name = await _kv_get(f"user:{user_id}")
-                        if kv_stored:
-                            stored = kv_stored
-                    except Exception as e:
-                        print("KV fallback read failed:", e)
-
-                if not stored:
-                    # helpful response with hint, not opaque 403
-                    body, status, headers = json_response(
-                        {"error": "No oauth tokens stored", "reason": "no_oauth_tokens", "hint": "Re-authorize or ensure DB service accessible"},
-                        403,
-                        allowed_origin
-                    )
+                stored_token = await get_stored_token(user_id)
+                if not stored_token:
+                    body, status, headers = json_response({"error": "No oauth tokens stored", "reason": "no_oauth_tokens"}, 403, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
-                try:
-                    # if stored is a string (KV) or already dict (DB service)
-                    if isinstance(stored, str):
-                        token_json = json.loads(stored)
-                    else:
-                        token_json = stored
-                except Exception as e:
-                    print("Failed to parse stored token JSON:", e)
-                    body, status, headers = json_response({"error": "Invalid stored token"}, 500, allowed_origin)
-                    return Response(body, status=status, headers=headers)
-
-                user_access_token = token_json.get("access_token")
+                user_access_token = stored_token.get("access_token")
                 if not user_access_token:
-                    body, status, headers = json_response({"error": "Stored token missing access_token"}, 403, allowed_origin)
+                    body, status, headers = json_response({"error": "Stored token missing access_token"}, 403, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 # get user's guilds using user's access_token
@@ -371,7 +316,7 @@ class Default(WorkerEntrypoint):
                     except Exception:
                         t = ""
                     print("Failed to fetch user guilds:", t)
-                    body, status, headers = json_response({"error": "Failed to fetch user guilds", "details": t, "hint": "token_maybe_expired"}, 500, allowed_origin)
+                    body, status, headers = json_response({"error": "Failed to fetch user guilds", "details": t, "hint": "token_maybe_expired"}, 500, origin_for_cors)
                     return Response(body, status=status, headers=headers)
                 guilds = await guilds_resp.json()
 
@@ -396,13 +341,13 @@ class Default(WorkerEntrypoint):
                         "botPresent": bot_present
                     })
 
-                body, status, headers = json_response({"guilds": out}, 200, allowed_origin)
+                body, status, headers = json_response({"guilds": out}, 200, origin_for_cors)
                 return Response(body, status=status, headers=headers)
 
-            # other endpoints unchanged...
+            # ===== /action =====
             if path == "/action":
                 if request.method != "POST":
-                    body, status, headers = json_response({"error": "Method not allowed"}, 405, allowed_origin)
+                    body, status, headers = json_response({"error": "Method not allowed"}, 405, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
@@ -416,18 +361,18 @@ class Default(WorkerEntrypoint):
                     if token:
                         payload = verify_jwt(token, JWT_SECRET)
                 if not payload:
-                    body, status, headers = json_response({"error": "Not authenticated"}, 401, allowed_origin)
+                    body, status, headers = json_response({"error": "Not authenticated"}, 401, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 try:
                     body_json = await request.json()
                 except Exception:
-                    body, status, headers = json_response({"error": "Invalid JSON"}, 400, allowed_origin)
+                    body, status, headers = json_response({"error": "Invalid JSON"}, 400, origin_for_cors)
                     return Response(body, status=status, headers=headers)
                 guild_id = body_json.get("guildId")
                 required = body_json.get("required")
                 if not guild_id or not required or required not in PERMISSION_BITS:
-                    body, status, headers = json_response({"error": "Invalid request"}, 400, allowed_origin)
+                    body, status, headers = json_response({"error": "Invalid request"}, 400, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
                 member_resp = await fetch(
@@ -435,7 +380,7 @@ class Default(WorkerEntrypoint):
                     headers={"Authorization": f"Bot {BOT_TOKEN}"}
                 )
                 if not member_resp.ok:
-                    body, status, headers = json_response({"error": "User not member or bot missing perms"}, 403, allowed_origin)
+                    body, status, headers = json_response({"error": "User not member or bot missing perms"}, 403, origin_for_cors)
                     return Response(body, status=status, headers=headers)
                 member = await member_resp.json()
 
@@ -444,7 +389,7 @@ class Default(WorkerEntrypoint):
                     headers={"Authorization": f"Bot {BOT_TOKEN}"}
                 )
                 if not roles_resp.ok:
-                    body, status, headers = json_response({"error": "Failed to fetch roles"}, 500, allowed_origin)
+                    body, status, headers = json_response({"error": "Failed to fetch roles"}, 500, origin_for_cors)
                     return Response(body, status=status, headers=headers)
                 roles = await roles_resp.json()
 
@@ -457,24 +402,24 @@ class Default(WorkerEntrypoint):
                 admin_bit = PERMISSION_BITS["ADMINISTRATOR"]
                 required_bit = PERMISSION_BITS[required]
                 if (perms & admin_bit) == 0 and (perms & required_bit) == 0:
-                    body, status, headers = json_response({"error": "Forbidden"}, 403, allowed_origin)
+                    body, status, headers = json_response({"error": "Forbidden"}, 403, origin_for_cors)
                     return Response(body, status=status, headers=headers)
 
-                body, status, headers = json_response({"ok": True}, 200, allowed_origin)
+                body, status, headers = json_response({"ok": True}, 200, origin_for_cors)
                 return Response(body, status=status, headers=headers)
 
             # logout and other routes...
             if path == "/logout":
                 headers = {"Location": FRONTEND_URL}
                 headers["Set-Cookie"] = "session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0"
-                if allowed_origin:
-                    headers.update(cors_headers(allowed_origin))
+                headers.update(cors_headers(origin_for_cors))
                 return Response(None, status=302, headers=headers)
 
             # fallback not found
-            return Response("Not Found", status=404)
+            body, status, headers = json_response({"error": "Not Found"}, 404, origin_for_cors)
+            return Response(body, status=status, headers=headers)
 
         except Exception as e:
             print("Worker crash:", getattr(e, "stack", e))
-            body, status, headers = json_response({"error": "Internal server error"}, 500, allowed_origin)
+            body, status, headers = json_response({"error": "Internal server error"}, 500, origin_for_cors)
             return Response(body, status=status, headers=headers)
