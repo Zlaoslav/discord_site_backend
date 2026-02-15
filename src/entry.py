@@ -548,7 +548,7 @@ class Default(WorkerEntrypoint):
                             return Response(body, status=status, headers=headers)
                         user_guilds = await user_resp.json()
 
-                        # 2️⃣ Гильдии бота (ОДИН запрос)
+                        # 2️⃣ Гильдии бота
                         bot_resp = await fetch(
                             "https://discord.com/api/users/@me/guilds",
                             headers={"Authorization": f"Bot {BOT_TOKEN}"}
@@ -576,18 +576,34 @@ class Default(WorkerEntrypoint):
                             if icon:
                                 icon_url = f"https://cdn.discordapp.com/icons/{g_id}/{icon}.png"
 
+                            member_count = None
+
+                            # Получаем approximate_member_count только если бот в гильдии
+                            if g_id in bot_guild_ids:
+                                guild_resp = await fetch(
+                                    f"https://discord.com/api/guilds/{g_id}?with_counts=true",
+                                    headers={"Authorization": f"Bot {BOT_TOKEN}"}
+                                )
+
+                                if guild_resp.ok:
+                                    guild_data = await guild_resp.json()
+                                    member_count = guild_data.get("approximate_member_count")
+                                else:
+                                    await guild_resp.body.cancel()
+
                             out.append({
                                 "id": g_id,
                                 "name": g.get("name"),
                                 "isAdmin": True,
                                 "botPresent": g_id in bot_guild_ids,
                                 "icon": icon,
-                                "iconUrl": icon_url
+                                "iconUrl": icon_url,
+                                "memberCount": member_count
                             })
 
                         body, status, headers = json_response({"guilds": out}, 200, allowed_origin)
                         return Response(body, status=status, headers=headers)
-        
+      
 
             # ===== /action =====
             if path == "/action":
