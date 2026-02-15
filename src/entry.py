@@ -527,7 +527,6 @@ class Default(WorkerEntrypoint):
 
                         user_id = payload["sub"]
 
-                        # =====> используем get_stored_token вместо _db_get_token / KV
                         token_json = await get_stored_token(user_id)
                         if not token_json:
                             body, status, headers = json_response(
@@ -566,6 +565,9 @@ class Default(WorkerEntrypoint):
                         import asyncio
                         bot_tasks = []
                         for g in guilds:
+                            perms = int(g.get("permissions", 0))
+                            if (perms & admin_bit) == 0:
+                                continue  # пропускаем гильдии, где пользователь не админ
                             g_id = g.get("id")
                             if CLIENT_ID:
                                 url = f"https://discord.com/api/guilds/{g_id}/members/{CLIENT_ID}"
@@ -577,9 +579,10 @@ class Default(WorkerEntrypoint):
                         bot_index = 0
 
                         for g in guilds:
-                            g_id = g.get("id")
                             perms = int(g.get("permissions", 0))
-                            is_admin = (perms & admin_bit) != 0
+                            if (perms & admin_bit) == 0:
+                                continue  # фильтруем на всякий случай
+                            g_id = g.get("id")
                             bot_present = False
 
                             if CLIENT_ID:
@@ -601,13 +604,14 @@ class Default(WorkerEntrypoint):
                                 "id": g_id,
                                 "name": g.get("name"),
                                 "permissions": perms,
-                                "isAdmin": is_admin,
-                                "botPresent": bot_present
+                                "isAdmin": True,
+                                "botPresent": bot_present,
+                                "icon": g.get("icon")  # добавляем аватар гильдии
                             })
 
                         body, status, headers = json_response({"guilds": out}, 200, allowed_origin)
                         return Response(body, status=status, headers=headers)
-          
+         
 
             # ===== /action =====
             if path == "/action":
