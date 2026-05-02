@@ -15,6 +15,7 @@ from submodule import (
 import secrets
 import urllib.parse
 import time
+import datetime
 import os
 import json
 import hashlib
@@ -92,6 +93,25 @@ class Default(WorkerEntrypoint):
             except Exception as e:
                 print("KV get failed:", e)
             return None, None
+
+        async def _kv_incr(key, amount=1):
+            try:
+                val, kv_name = await _kv_get(key)
+                cur = 0
+                if val:
+                    try:
+                        cur = int(val)
+                    except Exception:
+                        try:
+                            cur = int(json.loads(val))
+                        except Exception:
+                            cur = 0
+                new = cur + int(amount)
+                ok, where = await _kv_put(key, str(new))
+                return ok, new
+            except Exception as e:
+                print("KV increment failed:", e)
+                return False, None
 
         async def _db_store_token(user_id: str, token_json_obj: dict) -> bool:
             # low-level store to SUPABASE REST endpoint; ensures expires_at is set
@@ -676,6 +696,120 @@ class Default(WorkerEntrypoint):
                 headers.update(cors_headers(origin_for_cors))
                 return Response(None, status=302, headers=headers)
 
+            if path == "/daily_ping":
+                # Record a page view and return aggregated counts (last day, month, year, all time)
+                page_key = "/daily_ping"
+                counts = {"last_day": 0, "last_month": 0, "last_year": 0, "all_time": 0}
+
+                now_ts = int(time.time())
+                iso_day = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - 86400))
+                iso_month = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - 30 * 86400))
+                iso_year = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - 365 * 86400))
+
+                # Try Supabase RPC to atomically increment aggregated counters
+                db_res = None
+                if db:
+                    try:
+                        db_res = await db.increment_counters(page_key)
+                        if db_res:
+                            counts["last_day"] = int(db_res.get("last_day", 0))
+                            counts["last_month"] = int(db_res.get("last_month", 0))
+                            counts["last_year"] = int(db_res.get("last_year", 0))
+                            counts["all_time"] = int(db_res.get("all_time", 0))
+                    except Exception as e:
+                        print("Supabase increment error:", e)
+
+                # Always update KV counters if binding available — used for immediate increment
+                try:
+                    kv_binding = getattr(self.env, "OAUTH_TOKENS", None)
+                    # Only use KV as a fallback when Supabase is not available or RPC failed
+                    if kv_binding and (not db or db_res is None):
+                        utc = time.gmtime()
+                        hour_key = time.strftime("%Y-%m-%dT%H", utc)
+                        day_key = time.strftime("%Y-%m-%d", utc)
+                        month_key = time.strftime("%Y-%m", utc)
+                        year_key = time.strftime("%Y", utc)
+
+                        await _kv_incr(f"views:hour:{hour_key}", 1)
+                        await _kv_incr(f"views:day:{day_key}", 1)
+                        await _kv_incr(f"views:month:{month_key}", 1)
+                        await _kv_incr(f"views:year:{year_key}", 1)
+                        await _kv_incr("views:alltime", 1)
+
+                        # compute last 24 hours by summing hour keys
+                        last24 = 0
+                        for i in range(24):
+                            ts = time.gmtime(time.time() - i * 3600)
+                            k = time.strftime("%Y-%m-%dT%H", ts)
+                            val, _ = await _kv_get(f"views:hour:{k}")
+                            if val:
+                                try:
+                                    last24 += int(val)
+                                except Exception:
+                                    try:
+                                        last24 += int(json.loads(val))
+                                    except Exception:
+                                        pass
+
+                        # compute last 30 days by summing day keys
+                        last30 = 0
+                        for i in range(30):
+                            ts = time.gmtime(time.time() - i * 86400)
+                            k = time.strftime("%Y-%m-%d", ts)
+                            val, _ = await _kv_get(f"views:day:{k}")
+                            if val:
+                                try:
+                                    last30 += int(val)
+                                except Exception:
+                                    try:
+                                        last30 += int(json.loads(val))
+                                    except Exception:
+                                        pass
+
+                        # compute last 12 months by summing month keys
+                        last12 = 0
+                        now_dt = datetime.datetime.utcnow()
+                        year = now_dt.year
+                        month = now_dt.month
+                        for i in range(12):
+                            mval = month - i
+                            y = year
+                            while mval <= 0:
+                                mval += 12
+                                y -= 1
+                            k = f"{y:04d}-{mval:02d}"
+                            val, _ = await _kv_get(f"views:month:{k}")
+                            if val:
+                                try:
+                                    last12 += int(val)
+                                except Exception:
+                                    try:
+                                        last12 += int(json.loads(val))
+                                    except Exception:
+                                        pass
+
+                        allt, _ = await _kv_get("views:alltime")
+                        allt_val = 0
+                        if allt:
+                            try:
+                                allt_val = int(allt)
+                            except Exception:
+                                try:
+                                    allt_val = int(json.loads(allt))
+                                except Exception:
+                                    allt_val = 0
+
+                        # prefer KV numbers for immediate response when available
+                        counts["last_day"] = last24
+                        counts["last_month"] = last30
+                        counts["last_year"] = last12
+                        counts["all_time"] = allt_val
+                except Exception as e:
+                    print("KV view handling failed:", e)
+
+                body, status, headers = json_response(counts, 200, origin_for_cors)
+                return Response(body, status=status, headers=headers)
+            
             # fallback not found
             body, status, headers = json_response({"error": "Not Found"}, 404, origin_for_cors)
             return Response(body, status=status, headers=headers)
