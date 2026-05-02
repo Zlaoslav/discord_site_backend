@@ -696,6 +696,148 @@ class Default(WorkerEntrypoint):
                 headers.update(cors_headers(origin_for_cors))
                 return Response(None, status=302, headers=headers)
 
+            if path == "/daily_ping.svg":
+                # Record a page view and return an SVG badge (increments counters)
+                page_key = "/daily_ping"
+                counts = {"last_day": 0, "last_month": 0, "last_year": 0, "all_time": 0}
+
+                now_ts = int(time.time())
+                iso_day = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - 86400))
+                iso_month = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - 30 * 86400))
+                iso_year = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - 365 * 86400))
+
+                db_res = None
+                if db:
+                    try:
+                        db_res = await db.increment_counters(page_key)
+                        if db_res:
+                            counts["last_day"] = int(db_res.get("last_day", 0))
+                            counts["last_month"] = int(db_res.get("last_month", 0))
+                            counts["last_year"] = int(db_res.get("last_year", 0))
+                            counts["all_time"] = int(db_res.get("all_time", 0))
+                    except Exception as e:
+                        print("Supabase increment error (svg):", e)
+
+                # KV fallback increment and aggregates when DB not available
+                try:
+                    kv_binding = getattr(self.env, "OAUTH_TOKENS", None)
+                    if kv_binding and (not db or db_res is None):
+                        utc = time.gmtime()
+                        hour_key = time.strftime("%Y-%m-%dT%H", utc)
+                        day_key = time.strftime("%Y-%m-%d", utc)
+                        month_key = time.strftime("%Y-%m", utc)
+                        year_key = time.strftime("%Y", utc)
+
+                        await _kv_incr(f"views:hour:{hour_key}", 1)
+                        await _kv_incr(f"views:day:{day_key}", 1)
+                        await _kv_incr(f"views:month:{month_key}", 1)
+                        await _kv_incr(f"views:year:{year_key}", 1)
+                        await _kv_incr("views:alltime", 1)
+
+                        # compute last 24 hours by summing hour keys
+                        last24 = 0
+                        for i in range(24):
+                            ts = time.gmtime(time.time() - i * 3600)
+                            k = time.strftime("%Y-%m-%dT%H", ts)
+                            val, _ = await _kv_get(f"views:hour:{k}")
+                            if val:
+                                try:
+                                    last24 += int(val)
+                                except Exception:
+                                    try:
+                                        last24 += int(json.loads(val))
+                                    except Exception:
+                                        pass
+
+                        # compute last 30 days by summing day keys
+                        last30 = 0
+                        for i in range(30):
+                            ts = time.gmtime(time.time() - i * 86400)
+                            k = time.strftime("%Y-%m-%d", ts)
+                            val, _ = await _kv_get(f"views:day:{k}")
+                            if val:
+                                try:
+                                    last30 += int(val)
+                                except Exception:
+                                    try:
+                                        last30 += int(json.loads(val))
+                                    except Exception:
+                                        pass
+
+                        # compute last 12 months by summing month keys
+                        last12 = 0
+                        now_dt = datetime.datetime.utcnow()
+                        year = now_dt.year
+                        month = now_dt.month
+                        for i in range(12):
+                            mval = month - i
+                            y = year
+                            while mval <= 0:
+                                mval += 12
+                                y -= 1
+                            k = f"{y:04d}-{mval:02d}"
+                            val, _ = await _kv_get(f"views:month:{k}")
+                            if val:
+                                try:
+                                    last12 += int(val)
+                                except Exception:
+                                    try:
+                                        last12 += int(json.loads(val))
+                                    except Exception:
+                                        pass
+
+                        allt, _ = await _kv_get("views:alltime")
+                        allt_val = 0
+                        if allt:
+                            try:
+                                allt_val = int(allt)
+                            except Exception:
+                                try:
+                                    allt_val = int(json.loads(allt))
+                                except Exception:
+                                    allt_val = 0
+
+                        # prefer KV numbers for immediate response when available
+                        counts["last_day"] = last24
+                        counts["last_month"] = last30
+                        counts["last_year"] = last12
+                        counts["all_time"] = allt_val
+                except Exception as e:
+                    print("KV view handling failed (svg):", e)
+
+                # Build SVG badge
+                try:
+                    ld = counts.get("last_day", 0)
+                    lm = counts.get("last_month", 0)
+                    ly = counts.get("last_year", 0)
+                    at = counts.get("all_time", 0)
+                    updated = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+                    svg = f'''<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="520" height="110" viewBox="0 0 520 110">
+  <rect rx="14" width="520" height="110" fill="#0f1724"/>
+  <g font-family="Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Arial" fill="#fff">
+    <g transform="translate(28,28)">
+      <text x="0" y="0" font-size="12" fill="#9aa0a6">Daily ping</text>
+      <text x="0" y="28" font-size="20" font-weight="700">{ld}</text>
+    </g>
+    <g transform="translate(176,22)"><text x="0" y="0" font-size="16" font-weight="700">{ld}</text><text x="0" y="22" font-size="10" fill="#9aa0a6">Last day</text></g>
+    <g transform="translate(258,22)"><text x="0" y="0" font-size="16" font-weight="700">{lm}</text><text x="0" y="22" font-size="10" fill="#9aa0a6">Last month</text></g>
+    <g transform="translate(340,22)"><text x="0" y="0" font-size="16" font-weight="700">{ly}</text><text x="0" y="22" font-size="10" fill="#9aa0a6">Last year</text></g>
+    <g transform="translate(422,22)"><text x="0" y="0" font-size="16" font-weight="700">{at}</text><text x="0" y="22" font-size="10" fill="#9aa0a6">All time</text></g>
+    <text x="16" y="98" font-size="10" fill="#9aa0a6">Updated: {updated}</text>
+  </g>
+</svg>'''
+                except Exception as e:
+                    print("SVG generation failed:", e)
+                    svg = '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="40"><rect width="200" height="40" fill="#111"/><text x="10" y="24" fill="#fff">badge error</text></svg>'
+
+                hdrs = {"Content-Type": "image/svg+xml; charset=utf-8", "Cache-Control": "no-cache, no-store, must-revalidate"}
+                try:
+                    hdrs.update(cors_headers(origin_for_cors))
+                except Exception:
+                    pass
+                return Response(svg, status=200, headers=hdrs)
+
             if path == "/daily_ping":
                 # Record a page view and return aggregated counts (last day, month, year, all time)
                 page_key = "/daily_ping"
